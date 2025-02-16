@@ -1,31 +1,21 @@
 package io.debezium.server.iceberg;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import io.debezium.DebeziumException;
 import io.debezium.serde.DebeziumSerdes;
 import io.debezium.server.iceberg.batchsizewait.InterfaceBatchSizeWait;
 import io.debezium.server.iceberg.batchsizewait.NoBatchSizeWait;
 import io.debezium.server.iceberg.rpc.OlakeRowsIngester;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
-import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.Dependent;
-import jakarta.enterprise.inject.Any;
-import jakarta.enterprise.inject.Instance;
-import jakarta.enterprise.inject.se.SeContainer;
-import jakarta.enterprise.inject.se.SeContainerInitializer;
-import jakarta.inject.Inject;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serde;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.codehaus.jackson.type.TypeReference;
 
-import java.io.IOException;
 import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,7 +25,6 @@ public class OlakeRpcServer {
 
     protected static final Serde<JsonNode> valSerde = DebeziumSerdes.payloadJson(JsonNode.class);
     protected static final Serde<JsonNode> keySerde = DebeziumSerdes.payloadJson(JsonNode.class);
-    private Map<String, String> configMap;
     final static Configuration hadoopConf = new Configuration();
     final static Map<String, String> icebergProperties = new ConcurrentHashMap<>();
     static Catalog icebergCatalog;

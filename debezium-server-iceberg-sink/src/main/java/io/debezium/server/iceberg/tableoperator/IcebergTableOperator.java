@@ -45,7 +45,14 @@ public class IcebergTableOperator {
   IcebergTableWriterFactory writerFactory2;
 
   public IcebergTableOperator() {
+    createIdentifierFields = true;
     writerFactory2 = new IcebergTableWriterFactory();
+    writerFactory2.keepDeletes = true;
+    writerFactory2.upsert = true;
+    allowFieldAddition = true;
+    upsert = true;
+    cdcOpField = "__op";
+    cdcSourceTsMsField = "__source_ts_ms";
   }
 
   static final ImmutableMap<Operation, Integer> CDC_OPERATION_PRIORITY = ImmutableMap.of(Operation.INSERT, 1, Operation.READ, 2, Operation.UPDATE, 3, Operation.DELETE, 4);
