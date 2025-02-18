@@ -78,7 +78,11 @@ public class OlakeRpcServer {
 
 
         // Build the server to listen on port 50051
-        Server server = ServerBuilder.forPort(50051)
+        int port = 50051; // Default port
+        if (configMap.get("port") != null) {
+            port = Integer.parseInt(configMap.get("port"));
+        }
+        Server server = ServerBuilder.forPort(port)
                 .addService(ori)
                 .build()
                 .start();
