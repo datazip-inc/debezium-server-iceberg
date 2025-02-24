@@ -208,6 +208,8 @@ public class IcebergTableOperator {
     int maxRetries = 5;
     int retryDelayMs = 2000;
     
+
+    // TODO: Still the concurrent write exception is happening even if we run on upsert false or true. Need to fix
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       // Initialize a task writer for each attempt
       BaseTaskWriter<Record> writer = writerFactory2.create(icebergTable);
