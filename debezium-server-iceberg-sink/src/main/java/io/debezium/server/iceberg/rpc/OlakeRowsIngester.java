@@ -33,6 +33,10 @@ public class OlakeRowsIngester extends StringArrayServiceGrpc.StringArrayService
         icebergTableOperator = new IcebergTableOperator();
     }
 
+    public OlakeRowsIngester(boolean upsert_records) {
+        icebergTableOperator = new IcebergTableOperator(upsert_records);
+    }
+
     public void setIcebergNamespace(String icebergNamespace) {
         this.icebergNamespace = icebergNamespace;
     }

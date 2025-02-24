@@ -30,6 +30,8 @@ public class OlakeRpcServer {
     static Catalog icebergCatalog;
     static Deserializer<JsonNode> valDeserializer;
     static Deserializer<JsonNode> keyDeserializer;
+    static boolean upsert_records = true;
+    static boolean createIdFields = true;
 
 
     public static void main(String[] args) throws Exception {
@@ -54,6 +56,10 @@ public class OlakeRpcServer {
             throw new Exception("Iceberg table namespace not found");
         }
 
+        if (configMap.get("upsert") != null) {
+            upsert_records = Boolean.parseBoolean(configMap.get("upsert"));
+        }
+
         icebergCatalog = CatalogUtil.buildIcebergCatalog(catalogName, icebergProperties, hadoopConf);
 
         // TODO : change this to MaxBatchSizeWait based on config later
@@ -72,7 +78,7 @@ public class OlakeRpcServer {
 
 
         // Retrieve a CDI-managed bean from the container
-        ori = new OlakeRowsIngester();
+        ori = new OlakeRowsIngester(upsert_records);
         ori.setIcebergNamespace(configMap.get("table-namespace"));
         ori.setIcebergCatalog(icebergCatalog);
 
