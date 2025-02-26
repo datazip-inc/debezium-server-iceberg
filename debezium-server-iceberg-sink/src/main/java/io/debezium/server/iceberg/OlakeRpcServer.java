@@ -88,12 +88,21 @@ public class OlakeRpcServer {
         if (configMap.get("port") != null) {
             port = Integer.parseInt(configMap.get("port"));
         }
+        
+        // Get max message size from config or use a reasonable default (500MB)
+        int maxMessageSize = 500 * 1024 * 1024; // 500MB default
+        if (configMap.get("max-message-size") != null) {
+            maxMessageSize = Integer.parseInt(configMap.get("max-message-size"));
+        }
+        
         Server server = ServerBuilder.forPort(port)
                 .addService(ori)
+                .maxInboundMessageSize(maxMessageSize)
                 .build()
                 .start();
 
-        System.out.println("Server started on port 50051 with configuration: " + configMap);
+        System.out.println("Server started on port " + port + " with max message size: " + 
+                           (maxMessageSize / (1024 * 1024)) + "MB and configuration: " + configMap);
         server.awaitTermination();
     }
 
