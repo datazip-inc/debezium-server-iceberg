@@ -2,7 +2,6 @@ package io.debezium.server.iceberg.tableoperator;
 
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.types.Types.ListType;
 import org.apache.iceberg.types.Types.MapType;
 import org.apache.iceberg.types.Types.NestedField;
@@ -74,7 +73,7 @@ public class RecordProjection implements Record {
               boolean valueProjectable =
                   !projectedMap.valueType().isNestedType()
                       || projectedMap.valueType().equals(originalMap.valueType());
-              Preconditions.checkArgument(
+              com.google.common.base.Preconditions.checkArgument(
                   keyProjectable && valueProjectable,
                   "Cannot project a partial map key or value struct. Trying to project %s out of %s",
                   projectedField,
@@ -89,7 +88,7 @@ public class RecordProjection implements Record {
               boolean elementProjectable =
                   !projectedList.elementType().isNestedType()
                       || projectedList.elementType().equals(originalList.elementType());
-              Preconditions.checkArgument(
+                      com.google.common.base.Preconditions.checkArgument(
                   elementProjectable,
                   "Cannot project a partial list element struct. Trying to project %s out of %s",
                   projectedField,

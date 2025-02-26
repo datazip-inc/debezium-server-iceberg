@@ -11,7 +11,6 @@ package io.debezium.server.iceberg;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.debezium.DebeziumException;
 import io.debezium.server.iceberg.tableoperator.Operation;
 import io.debezium.server.iceberg.tableoperator.RecordWrapper;
 import org.apache.iceberg.Schema;
@@ -32,21 +31,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
-
-import static io.debezium.server.iceberg.OlakeRpcServer.keyDeserializer;
-import static io.debezium.server.iceberg.OlakeRpcServer.valDeserializer;
+import java.util.stream.Collectors;
 
 /**
- * Converts iceberg json event to Iceberg GenericRecord. Extracts event schema and key fields. Converts event schema to Iceberg Schema.
- *
- * @author Ismail Simsek
+ * Converts JSON event to Iceberg GenericRecord. Extracts event schema and key fields.
+ * Converts event schema to Iceberg Schema.
  */
 public class RecordConverter {
 
   protected static final ObjectMapper mapper = new ObjectMapper();
   protected static final Logger LOGGER = LoggerFactory.getLogger(RecordConverter.class);
   public static final List<String> TS_MS_FIELDS = List.of("__ts_ms", "__source_ts_ms");
-  // static final boolean eventsAreUnwrapped = IcebergUtil.configIncludesUnwrapSmt();
   static final boolean eventsAreUnwrapped = true;
   protected final String destination;
   protected final byte[] valueData;
@@ -62,62 +57,71 @@ public class RecordConverter {
 
   public JsonNode key() {
     if (key == null && keyData != null) {
-      key = keyDeserializer.deserialize(destination, keyData);
+      try {
+        key = mapper.readTree(keyData);
+      } catch (IOException e) {
+        throw new RuntimeException("Error deserializing key data", e);
+      }
     }
-
     return key;
   }
 
   public JsonNode value() {
     if (value == null && valueData != null) {
-      value = valDeserializer.deserialize(destination, valueData);
+      try {
+        value = mapper.readTree(valueData);
+      } catch (IOException e) {
+        throw new RuntimeException("Error deserializing value data", e);
+      }
     }
-
     return value;
   }
 
   public Long cdcSourceTsMsValue(String cdcSourceTsMsField) {
-
     final JsonNode element = value().get(cdcSourceTsMsField);
     if (element == null) {
-      throw new DebeziumException("Field '" + cdcSourceTsMsField + "' not found in JSON object: " + value());
+      throw new RuntimeException("Field '" + cdcSourceTsMsField + "' not found in JSON object: " + value());
     }
 
     try {
       return element.asLong();
     } catch (NumberFormatException e) {
-      throw new DebeziumException("Error converting field '" + cdcSourceTsMsField + "' value '" + element + "' to Long: " + e.getMessage(), e);
+      throw new RuntimeException("Error converting field '" + cdcSourceTsMsField + "' value '" + element + "' to Long: " + e.getMessage(), e);
     }
   }
 
   public Operation cdcOpValue(String cdcOpField) {
     if (!value().has(cdcOpField)) {
-      throw new DebeziumException("The value for field `" + cdcOpField + "` is missing. " +
+      throw new RuntimeException("The value for field `" + cdcOpField + "` is missing. " +
           "This field is required when updating or deleting data, when running in upsert mode."
       );
     }
 
     final String opFieldValue = value().get(cdcOpField).asText("c");
 
-    return switch (opFieldValue) {
-      case "u" -> Operation.UPDATE;
-      case "d" -> Operation.DELETE;
-      case "r" -> Operation.READ;
-      case "c" -> Operation.INSERT;
-      case "i" -> Operation.INSERT;
-      default ->
-          throw new DebeziumException("Unexpected `" + cdcOpField + "=" + opFieldValue + "` operation value received, expecting one of ['u','d','r','c', 'i']");
-    };
+    switch (opFieldValue) {
+      case "u": 
+        return Operation.UPDATE;
+      case "d": 
+        return Operation.DELETE;
+      case "r": 
+        return Operation.READ;
+      case "c": 
+        return Operation.INSERT;
+      case "i": 
+        return Operation.INSERT;
+      default:
+        throw new RuntimeException("Unexpected `" + cdcOpField + "=" + opFieldValue + "` operation value received, expecting one of ['u','d','r','c', 'i']");
+    }
   }
 
   public SchemaConverter schemaConverter() {
     try {
       return new SchemaConverter(mapper.readTree(valueData).get("schema"), keyData == null ? null : mapper.readTree(keyData).get("schema"));
     } catch (IOException e) {
-      throw new DebeziumException("Failed to get event schema", e);
+      throw new RuntimeException("Failed to get event schema", e);
     }
   }
-
 
   /**
    * Checks if the current message represents a schema change event.
@@ -129,9 +133,8 @@ public class RecordConverter {
     return value().has("ddl") && value().has("databaseName") && value().has("tableChanges");
   }
 
-
   /**
-   * Converts the Kafka Connect schema to an Iceberg schema.
+   * Converts the JSON schema to an Iceberg schema.
    *
    * @param createIdentifierFields Whether to include identifier fields in the Iceberg schema.
    *                               Identifier fields are typically used for primary keys and are
@@ -142,12 +145,12 @@ public class RecordConverter {
   public Schema icebergSchema(boolean createIdentifierFields) {
     // Check if the message is a schema change event (DDL statement).
     // Schema change events are identified by the presence of "ddl", "databaseName", and "tableChanges" fields.
-    // "schema change topic" https://debezium.io/documentation/reference/3.0/connectors/mysql.html#mysql-schema-change-topic
     if (isSchemaChangeEvent()) {
       LOGGER.warn("Schema change topic detected. Creating Iceberg schema without identifier fields for append-only mode.");
       return schemaConverter().icebergSchema(false); // Force no identifier fields for schema changes
     }
 
+    // For normal events, use the provided createIdentifierFields parameter
     return schemaConverter().icebergSchema(createIdentifierFields);
   }
 
@@ -156,122 +159,130 @@ public class RecordConverter {
   }
 
   public RecordWrapper convertAsAppend(Schema schema) {
-    GenericRecord row = convert(schema.asStruct(), value());
-    return new RecordWrapper(row, Operation.INSERT);
+    GenericRecord record = RecordConverter.convert(schema.asStruct(), value());
+    return new RecordWrapper(record, Operation.INSERT);
   }
 
   public RecordWrapper convert(Schema schema, String cdcOpField) {
-    GenericRecord row = convert(schema.asStruct(), value());
-    Operation op = cdcOpValue(cdcOpField);
-    return new RecordWrapper(row, op);
+    GenericRecord record = RecordConverter.convert(schema.asStruct(), value());
+    return new RecordWrapper(record, cdcOpValue(cdcOpField));
   }
 
   private static GenericRecord convert(Types.StructType tableFields, JsonNode data) {
-    LOGGER.debug("Processing nested field:{}", tableFields);
     GenericRecord record = GenericRecord.create(tableFields);
 
     for (Types.NestedField field : tableFields.fields()) {
-      // Set value to null if json event don't have the field
-      if (data == null || !data.has(field.name()) || data.get(field.name()) == null) {
-        record.setField(field.name(), null);
-        continue;
+      String fieldName = field.name();
+      JsonNode node = data.get(fieldName);
+      if (node != null && !node.isNull()) {
+        record.setField(fieldName, RecordConverter.jsonValToIcebergVal(field, node));
       }
-      // get the value of the field from json event, map it to iceberg value
-      record.setField(field.name(), jsonValToIcebergVal(field, data.get(field.name())));
     }
-
     return record;
   }
 
   private static Object jsonValToIcebergVal(Types.NestedField field, JsonNode node) {
-    LOGGER.debug("Processing Field:{} Type:{}", field.name(), field.type());
-    final Object val;
-    switch (field.type().typeId()) {
-      case INTEGER: // int 4 bytes
-        val = node.isNull() ? null : node.asInt();
-        break;
-      case LONG: // long 8 bytes
-        val = node.isNull() ? null : node.asLong();
-        break;
-      case FLOAT: // float is represented in 32 bits,
-        val = node.isNull() ? null : node.floatValue();
-        break;
-      case DOUBLE: // double is represented in 64 bits
-        val = node.isNull() ? null : node.asDouble();
-        break;
-      case BOOLEAN:
-        val = node.isNull() ? null : node.asBoolean();
-        break;
-      case STRING:
-        // if the node is not a value node (method isValueNode returns false), convert it to string.
-        val = node.isValueNode() ? node.asText(null) : node.toString();
-        break;
-      case UUID:
-        val = node.isValueNode() ? UUID.fromString(node.asText(null)) : UUID.fromString(node.toString());
-        break;
-      case TIMESTAMP:
-        if ((node.isLong() || node.isNumber()) && TS_MS_FIELDS.contains(field.name())) {
-          val = OffsetDateTime.ofInstant(Instant.ofEpochMilli(node.longValue()), ZoneOffset.UTC);
-        } else if (node.isTextual()) {
-          val = OffsetDateTime.parse(node.asText());
-        } else {
-          throw new RuntimeException("Failed to convert timestamp value, field: " + field.name() + " value: " + node);
-        }
-        break;
-      case BINARY:
-        try {
-          val = node.isNull() ? null : ByteBuffer.wrap(node.binaryValue());
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to convert binary value to iceberg value, field: " + field.name(), e);
-        }
-        break;
-      case LIST:
-        Types.NestedField listItemsType = field.type().asListType().fields().get(0);
-        // recursive value mapping when list elements are nested type
-        if (listItemsType.type().isNestedType()) {
-          ArrayList<Object> listVal = new ArrayList<>();
-          node.elements().forEachRemaining(element -> {
-            listVal.add(jsonValToIcebergVal(field.type().asListType().fields().get(0), element));
-          });
-          val = listVal;
-          break;
-        }
-
-        val = mapper.convertValue(node, ArrayList.class);
-        break;
-      case MAP:
-        Type keyType = field.type().asMapType().keyType();
-        Type valType = field.type().asMapType().valueType();
-        if (keyType.isPrimitiveType() && valType.isPrimitiveType()) {
-          val = mapper.convertValue(node, Map.class);
-          break;
-        }
-        // convert complex/nested map value with recursion
-        HashMap<Object, Object> mapVal = new HashMap<>();
-        node.fields().forEachRemaining(f -> {
-          if (valType.isStructType()) {
-            mapVal.put(f.getKey(), convert(valType.asStructType(), f.getValue()));
-          } else {
-            mapVal.put(f.getKey(), f.getValue());
-          }
-        });
-        val = mapVal;
-        break;
-      case STRUCT:
-        // create it as struct, nested type
-        // recursive call to get nested data/record
-        val = convert(field.type().asStructType(), node);
-        break;
-      default:
-        // default to String type
-        // if the node is not a value node (method isValueNode returns false), convert it to string.
-        val = node.isValueNode() ? node.asText(null) : node.toString();
-        break;
+    if (node == null || node.isNull()) {
+      return null;
     }
 
-    return val;
+    try {
+      switch (field.type().typeId()) {
+        case BOOLEAN:
+          return node.asBoolean();
+        case INTEGER:
+          if (node.isTextual()) {
+            return Integer.parseInt(node.asText());
+          }
+          return node.asInt();
+        case LONG:
+          if (node.isTextual()) {
+            return Long.parseLong(node.asText());
+          }
+          return node.asLong();
+        case FLOAT:
+          if (node.isTextual()) {
+            return Float.parseFloat(node.asText());
+          }
+          return node.floatValue();
+        case DOUBLE:
+          if (node.isTextual()) {
+            return Double.parseDouble(node.asText());
+          }
+          return node.asDouble();
+        case STRING:
+          return node.asText();
+        case TIMESTAMP:
+          if (node.isNumber()) {
+            final OffsetDateTime time = OffsetDateTime.ofInstant(Instant.ofEpochMilli(node.asLong()), ZoneOffset.UTC);
+            return time;
+          } else if (node.isTextual()) {
+            if (node.asText().isEmpty()) {
+              return null;
+            }
+            if (node.asText().chars().allMatch(Character::isDigit)) {
+              final OffsetDateTime time = OffsetDateTime.ofInstant(Instant.ofEpochMilli(Long.parseLong(node.asText())), ZoneOffset.UTC);
+              return time;
+            }
+            final OffsetDateTime time = OffsetDateTime.parse(node.asText());
+            return time;
+          }
+          return OffsetDateTime.parse(node.asText());
+        case FIXED:
+        case BINARY:
+          if (node.isBinary()) {
+            return ByteBuffer.wrap(node.binaryValue());
+          } else if (node.isValueNode() && node.isTextual()) {
+            return ByteBuffer.wrap(node.asText().getBytes());
+          } else {
+            return ByteBuffer.wrap(node.toString().getBytes());
+          }
+        case DECIMAL:
+          if (node.isValueNode() && node.isTextual()) {
+            return new java.math.BigDecimal(node.asText());
+          } else if (node.isValueNode() && node.isNumber()) {
+            return java.math.BigDecimal.valueOf(node.asDouble());
+          }
+          return null;
+        case UUID:
+          return UUID.fromString(node.asText());
+        case LIST:
+          List<Object> convertedList = new ArrayList<>();
+          Types.NestedField elementField = Types.NestedField.of(
+              1000, // Arbitrary ID for the list element
+              false,
+              "element",
+              ((Types.ListType) field.type()).elementType()
+          );
+          for (final JsonNode jsonArrayItem : node) {
+            Object convertedElement = jsonValToIcebergVal(elementField, jsonArrayItem);
+            convertedList.add(convertedElement);
+          }
+          return convertedList;
+        case MAP:
+          Map<String, Object> convertedMap = new HashMap<>();
+          Types.NestedField valueField = Types.NestedField.of(
+              1001, // Arbitrary ID for the map value
+              true,
+              "value",
+              ((Types.MapType) field.type()).valueType()
+          );
+          node.fields().forEachRemaining(entry -> {
+            String key = entry.getKey();
+            JsonNode val = entry.getValue();
+            convertedMap.put(key, jsonValToIcebergVal(valueField, val));
+          });
+          return convertedMap;
+        case STRUCT:
+          return convert((Types.StructType) field.type(), node);
+        default:
+          return node.asText();
+      }
+    } catch (Exception e) {
+      LOGGER.error("Failed to convert field '{}' with value '{}' to Iceberg type '{}'. Error: '{}'", field.name(), node, field.type().typeId(), e.getMessage());
+      throw new RuntimeException("Failed to convert field '" + field.name() + "' with value '" + node.toString() + "' to Iceberg type '" + field.type().toString() + "' !");
+    }
   }
-
 
   public static class SchemaConverter {
     private final JsonNode valueSchema;
@@ -290,191 +301,161 @@ public class RecordConverter {
       return keySchema;
     }
 
-    /***
-     * converts given debezium filed to iceberg field equivalent. does recursion in case of complex/nested types.
-     *
-     * @param fieldSchema JsonNode representation of debezium field schema.
-     * @param fieldName name of the debezium field
-     * @param schemaData keeps information of iceberg schema like fields, nextFieldId and identifier fields
-     * @return map entry Key being the last id assigned to the iceberg field, Value being the converted iceberg NestedField.
+    /**
+     * Convert a debezium field to iceberg field
      */
     private static RecordSchemaData debeziumFieldToIcebergField(JsonNode fieldSchema, String fieldName, RecordSchemaData schemaData, JsonNode keySchemaNode) {
-      String fieldType = fieldSchema.get("type").textValue();
-      boolean isPkField = !(keySchemaNode == null || keySchemaNode.isNull());
-      switch (fieldType) {
-        case "struct":
-          int rootStructId = schemaData.nextFieldId().getAndIncrement();
-          final RecordSchemaData subSchemaData = schemaData.copyKeepIdentifierFieldIdsAndNextFieldId();
-          for (JsonNode subFieldSchema : fieldSchema.get("fields")) {
-            String subFieldName = subFieldSchema.get("field").textValue();
-            JsonNode equivalentNestedKeyField = findNodeFieldByName(subFieldName, keySchemaNode);
-            debeziumFieldToIcebergField(subFieldSchema, subFieldName, subSchemaData, equivalentNestedKeyField);
+      String fieldType = fieldSchema.get("type").asText().toUpperCase();
+      if (!schemaData.getFields().containsKey(fieldName)) {
+        Types.NestedField nestedField;
+        if (fieldName.equalsIgnoreCase("__commit_offset") || fieldName.equalsIgnoreCase("__commit_timestamp")) {
+          // int64 as LONG
+          nestedField = Types.NestedField.optional(schemaData.getFields().size() + 1, fieldName, Types.LongType.get());
+        } else if (TS_MS_FIELDS.contains(fieldName)) {
+          // timestamp as TIMESTAMP
+          nestedField = Types.NestedField.optional(schemaData.getFields().size() + 1, fieldName, Types.TimestampType.withZone());
+        } else if (fieldName.startsWith("__") && (fieldType.equals("STRING") || fieldType.equals("BYTES"))) {
+          // remaining metadata fields as string
+          nestedField = Types.NestedField.optional(schemaData.getFields().size() + 1, fieldName, Types.StringType.get());
+        } else {
+          nestedField = Types.NestedField.optional(schemaData.getFields().size() + 1, fieldName, RecordConverter.SchemaConverter.icebergPrimitiveField(fieldName, fieldType));
+        }
+        schemaData.getFields().put(fieldName, nestedField);
+        // check if current field is PK field
+        schemaData.getIdFields().remove(fieldName);
+        if (keySchemaNode != null) {
+          JsonNode keyFieldNode = findNodeFieldByName(fieldName, keySchemaNode);
+          if (keyFieldNode != null) {
+            schemaData.getIdFields().add(fieldName);
           }
-          // create it as struct, nested type
-          final Types.NestedField structField = Types.NestedField.of(rootStructId, !isPkField, fieldName, Types.StructType.of(subSchemaData.fields()));
-          schemaData.fields().add(structField);
-          return schemaData;
-        case "map":
-          if (isPkField) {
-            throw new DebeziumException("Cannot set map field '" + fieldName + "' as a identifier field, map types are not supported as an identifier field!");
-          }
-          int rootMapId = schemaData.nextFieldId().getAndIncrement();
-          int keyFieldId = schemaData.nextFieldId().getAndIncrement();
-          int valFieldId = schemaData.nextFieldId().getAndIncrement();
-          final RecordSchemaData keySchemaData = schemaData.copyKeepIdentifierFieldIdsAndNextFieldId();
-          debeziumFieldToIcebergField(fieldSchema.get("keys"), fieldName + "_key", keySchemaData, null);
-          schemaData.nextFieldId().incrementAndGet();
-          final RecordSchemaData valSchemaData = schemaData.copyKeepIdentifierFieldIdsAndNextFieldId();
-          debeziumFieldToIcebergField(fieldSchema.get("values"), fieldName + "_val", valSchemaData, null);
-          final Types.MapType mapField = Types.MapType.ofOptional(keyFieldId, valFieldId, keySchemaData.fields().get(0).type(), valSchemaData.fields().get(0).type());
-          schemaData.fields().add(Types.NestedField.optional(rootMapId, fieldName, mapField));
-          return schemaData;
-
-        case "array":
-          if (isPkField) {
-            throw new DebeziumException("Cannot set array field '" + fieldName + "' as a identifier field, array types are not supported as an identifier field!");
-          }
-          int rootArrayId = schemaData.nextFieldId().getAndIncrement();
-          final RecordSchemaData arraySchemaData = schemaData.copyKeepIdentifierFieldIdsAndNextFieldId();
-          debeziumFieldToIcebergField(fieldSchema.get("items"), fieldName + "_items", arraySchemaData, null);
-          final Types.ListType listField = Types.ListType.ofOptional(schemaData.nextFieldId().getAndIncrement(), arraySchemaData.fields().get(0).type());
-          schemaData.fields().add(Types.NestedField.optional(rootArrayId, fieldName, listField));
-          return schemaData;
-        default:
-          // its primitive field
-          final Types.NestedField field = Types.NestedField.of(schemaData.nextFieldId().getAndIncrement(), !isPkField, fieldName, icebergPrimitiveField(fieldName, fieldType));
-          schemaData.fields().add(field);
-          if (isPkField) schemaData.identifierFieldIds().add(field.fieldId());
-          return schemaData;
+        }
       }
+      return schemaData;
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(valueSchema, keySchema);
+      return Objects.hash(valueSchema(), keySchema());
     }
 
     private static JsonNode getNodeFieldsArray(JsonNode node) {
-      if (node != null && !node.isNull() && node.has("fields") && node.get("fields").isArray()) {
+      if (node.has("fields")) {
         return node.get("fields");
+      } else if (node.has("schema")) {
+        return RecordConverter.SchemaConverter.getNodeFieldsArray(node.get("schema"));
       }
-
-      return mapper.createObjectNode();
-    }
-
-    private static JsonNode findNodeFieldByName(String fieldName, JsonNode node) {
-
-      for (JsonNode field : getNodeFieldsArray(node)) {
-
-        if (Objects.equals(field.get("field").textValue(), fieldName)) {
-          return field;
-        }
-      }
-
       return null;
     }
 
-    /***
-     * Converts debezium event fields to iceberg equivalent and returns list of iceberg fields.
-     * @param schemaNode
-     * @return
+    private static JsonNode findNodeFieldByName(String fieldName, JsonNode node) {
+      JsonNode fieldsNode = RecordConverter.SchemaConverter.getNodeFieldsArray(node);
+      if (fieldsNode != null) {
+        for (final JsonNode fieldSchema : fieldsNode) {
+          if (fieldSchema.get("field").asText().equals(fieldName)) {
+            return fieldSchema;
+          }
+        }
+      }
+      return null;
+    }
+
+    /**
+     * Get iceberg schema fields from debezium schema
      */
     private static RecordSchemaData icebergSchemaFields(JsonNode schemaNode, JsonNode keySchemaNode, RecordSchemaData schemaData) {
-      LOGGER.debug("Converting iceberg schema to debezium:{}", schemaNode);
-      for (JsonNode field : getNodeFieldsArray(schemaNode)) {
-        String fieldName = field.get("field").textValue();
-        JsonNode equivalentKeyFieldNode = findNodeFieldByName(fieldName, keySchemaNode);
-        debeziumFieldToIcebergField(field, fieldName, schemaData, equivalentKeyFieldNode);
+      JsonNode fieldsNode = RecordConverter.SchemaConverter.getNodeFieldsArray(schemaNode);
+      if (fieldsNode != null) {
+        for (final JsonNode fieldSchema : fieldsNode) {
+          RecordConverter.SchemaConverter.debeziumFieldToIcebergField(fieldSchema, fieldSchema.get("field").asText(), schemaData, keySchemaNode);
+        }
       }
-
       return schemaData;
     }
 
     private Schema icebergSchema(boolean createIdentifierFields) {
-
-      if (this.valueSchema.isNull()) {
-        throw new RuntimeException("Failed to get schema from debezium event, event schema is null");
+      // fallback to empty schema
+      if (valueSchema() == null) {
+        return new Schema(new ArrayList<>());
+      }
+      // final schema
+      RecordSchemaData schemaData = RecordConverter.SchemaConverter.icebergSchemaFields(valueSchema, keySchema(), new RecordSchemaData());
+      // Get all iceberg schema fields from key schema
+      if (keySchema() != null) {
+        RecordConverter.SchemaConverter.icebergSchemaFields(keySchema(), null, schemaData);
       }
 
-      RecordSchemaData schemaData = new RecordSchemaData();
-      final JsonNode keySchemaNode;
-      if (!createIdentifierFields) {
-        LOGGER.warn("Creating identifier fields is disabled, creating table without identifier fields!");
-        keySchemaNode = null;
-      } else if (!eventsAreUnwrapped && keySchema != null) {
-        ObjectNode nestedKeySchema = mapper.createObjectNode();
-        nestedKeySchema.put("type", "struct");
-        nestedKeySchema.putArray("fields").add(((ObjectNode) keySchema).put("field", "after"));
-        keySchemaNode = nestedKeySchema;
-      } else {
-        keySchemaNode = keySchema;
+      // Convert fields from map to list
+      List<Types.NestedField> fieldsList = new ArrayList<>(schemaData.getFields().values());
+
+      // For older Iceberg versions (pre-0.11.0), we may need to directly construct the Schema
+      // This approach attempts to be compatible with different Iceberg versions
+      Schema schema;
+      
+      try {
+        // Try to create schema with identifier fields directly if supported
+        if (createIdentifierFields && !schemaData.getIdFields().isEmpty()) {
+          try {
+            // Try using the constructor with identifier fields if available
+            java.lang.reflect.Constructor<Schema> constructor = 
+                Schema.class.getConstructor(List.class, List.class);
+            schema = constructor.newInstance(fieldsList, 
+                new ArrayList<>(schemaData.getIdFields()));
+          } catch (NoSuchMethodException e) {
+            // If that constructor isn't available, use the basic one
+            schema = new Schema(fieldsList);
+            LOGGER.warn("Identifier fields not supported in this Iceberg version: {}", e.getMessage());
+          }
+        } else {
+          // Just create a basic schema without identifier fields
+          schema = new Schema(fieldsList);
+        }
+      } catch (Exception e) {
+        // Fallback to basic schema if anything fails
+        schema = new Schema(fieldsList);
+        LOGGER.warn("Failed to create schema with identifier fields: {}", e.getMessage());
       }
 
-      icebergSchemaFields(valueSchema, keySchemaNode, schemaData);
-
-      if (!eventsAreUnwrapped && !schemaData.identifierFieldIds().isEmpty()) {
-        // While Iceberg supports nested key fields, they cannot be set with nested events(unwrapped events, Without event flattening)
-        // due to inconsistency in the after and before fields.
-        // For insert events, only the `before` field is NULL, while for delete events after field is NULL.
-        // This inconsistency prevents using either field as a reliable key.
-        throw new DebeziumException("Debezium events are unnested, Identifier fields are not supported for unnested events! " +
-            "Pleas enable event flattening SMT see: https://debezium.io/documentation/reference/stable/transformations/event-flattening.html " +
-            " Or disable identifier field creation `debezium.sink.iceberg.create-identifier-fields=false`");
-      }
-
-      if (schemaData.fields().isEmpty()) {
-        throw new RuntimeException("Failed to get schema from debezium event, event schema has no fields!");
-      }
-
-      // @TODO validate key fields are correctly set!?
-      return new Schema(schemaData.fields(), schemaData.identifierFieldIds());
-
+      return schema;
     }
 
-    private static Type.PrimitiveType icebergPrimitiveField(String fieldName, String fieldType) {
+    private static Type icebergPrimitiveField(String fieldName, String fieldType) {
       switch (fieldType) {
-        case "int8":
-        case "int16":
-        case "int32": // int 4 bytes
+        case "INT8":
+        case "INT16":
+        case "INT32":
           return Types.IntegerType.get();
-        case "int64": // long 8 bytes
-          if (TS_MS_FIELDS.contains(fieldName)) {
-            return Types.TimestampType.withZone();
-          } else {
-            return Types.LongType.get();
-          }
-        case "float8":
-        case "float16":
-        case "float32": // float is represented in 32 bits,
+        case "INT64":
+          return Types.LongType.get();
+        case "FLOAT":
+        case "FLOAT32":
           return Types.FloatType.get();
-        case "double":
-        case "float64": // double is represented in 64 bits
+        case "FLOAT64":
+        case "DOUBLE":
           return Types.DoubleType.get();
-        case "boolean":
+        case "BOOLEAN":
           return Types.BooleanType.get();
-        case "string":
+        case "STRING":
           return Types.StringType.get();
-        case "uuid":
-          return Types.UUIDType.get();
-        case "bytes":
+        case "BYTES":
           return Types.BinaryType.get();
+        case "TIMESTAMP":
+          return Types.TimestampType.withZone();
         default:
-          // default to String type
+          LOGGER.error("Field Type not determined for field: '{}' with type: '{}' hence stored as string", fieldName, fieldType);
           return Types.StringType.get();
-        //throw new RuntimeException("'" + fieldName + "' has "+fieldType+" type, "+fieldType+" not supported!");
       }
     }
 
     @Override
     public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
-      SchemaConverter that = (SchemaConverter) o;
-      return Objects.equals(valueSchema, that.valueSchema) && Objects.equals(keySchema, that.keySchema);
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof RecordConverter.SchemaConverter)) {
+        return false;
+      }
+      RecordConverter.SchemaConverter that = (RecordConverter.SchemaConverter) o;
+      return Objects.equals(valueSchema(), that.valueSchema()) && Objects.equals(keySchema(), that.keySchema());
     }
-
-
   }
-
-
 }

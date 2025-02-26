@@ -8,15 +8,11 @@
 
 package io.debezium.server.iceberg.batchsizewait;
 
-import jakarta.enterprise.context.Dependent;
-import jakarta.inject.Named;
 
 /**
  * Optimizes batch size around 85%-90% of max,batch.size using dynamically calculated sleep(ms)
  *
  * @author Ismail Simsek
  */
-@Dependent
-@Named("NoBatchSizeWait")
 public class NoBatchSizeWait implements InterfaceBatchSizeWait {
 }

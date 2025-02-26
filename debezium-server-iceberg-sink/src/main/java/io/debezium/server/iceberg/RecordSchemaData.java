@@ -3,26 +3,45 @@ package io.debezium.server.iceberg;
 import org.apache.iceberg.types.Types;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 
-record RecordSchemaData(List<Types.NestedField> fields, Set<Integer> identifierFieldIds,
-                        AtomicInteger nextFieldId) {
+/**
+ * Contains schema data for Iceberg tables
+ */
+public class RecordSchemaData {
+    public final Map<String, Types.NestedField> fields;
+    public final Set<String> idFields;
+    private int nextId;
 
+    public RecordSchemaData() {
+        this.fields = new HashMap<>();
+        this.idFields = new HashSet<>();
+        this.nextId = 1;
+    }
 
-  public RecordSchemaData(Integer nextFieldId) {
-    this(new ArrayList<>(), new HashSet<>(), new AtomicInteger(nextFieldId));
-  }
+    public RecordSchemaData(Map<String, Types.NestedField> fields, Set<String> idFields, int nextId) {
+        this.fields = fields;
+        this.idFields = idFields;
+        this.nextId = nextId;
+    }
 
-  public RecordSchemaData() {
-    this(new ArrayList<>(), new HashSet<>(), new AtomicInteger(1));
-  }
+    public RecordSchemaData copyKeepIdentifierFields() {
+        return new RecordSchemaData(new HashMap<>(), this.idFields, this.nextId);
+    }
 
-  public RecordSchemaData copyKeepIdentifierFieldIdsAndNextFieldId() {
-    return new RecordSchemaData(new ArrayList<>(), this.identifierFieldIds, this.nextFieldId);
-  }
+    public int getNextId() {
+        return nextId++;
+    }
 
+    public Map<String, Types.NestedField> getFields() {
+        return fields;
+    }
 
+    public Set<String> getIdFields() {
+        return idFields;
+    }
 }

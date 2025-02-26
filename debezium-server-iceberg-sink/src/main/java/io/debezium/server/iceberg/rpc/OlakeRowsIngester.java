@@ -1,16 +1,16 @@
 package io.debezium.server.iceberg.rpc;
 
-import io.debezium.DebeziumException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.debezium.server.iceberg.IcebergUtil;
 import io.debezium.server.iceberg.RecordConverter;
 import io.debezium.server.iceberg.tableoperator.IcebergTableOperator;
 import io.grpc.stub.StreamObserver;
-import jakarta.enterprise.context.Dependent;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.codehaus.jackson.map.ObjectMapper;
-import org.codehaus.jackson.type.TypeReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -18,15 +18,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-
-// This class is used to receive rows from the Olake Golang project and dump it into iceberg using prebuilt code here.
-@Dependent
+/**
+ * This class is used to receive rows from the client and write them to Iceberg tables.
+ */
 public class OlakeRowsIngester extends StringArrayServiceGrpc.StringArrayServiceImplBase {
-
-
+    private static final Logger LOGGER = LoggerFactory.getLogger(OlakeRowsIngester.class);
     private String icebergNamespace = "public";
-    Catalog icebergCatalog;
-
+    private Catalog icebergCatalog;
     private final IcebergTableOperator icebergTableOperator;
 
     public OlakeRowsIngester() {
@@ -44,7 +42,6 @@ public class OlakeRowsIngester extends StringArrayServiceGrpc.StringArrayService
     public void setIcebergCatalog(Catalog icebergCatalog) {
         this.icebergCatalog = icebergCatalog;
     }
-
 
     @Override
     public void sendStringArray(Messaging.StringArrayRequest request, StreamObserver<Messaging.StringArrayResponse> responseObserver) {
@@ -75,8 +72,6 @@ public class OlakeRowsIngester extends StringArrayServiceGrpc.StringArrayService
                                 return new RecordConverter(destinationTable,
                                         valueString.getBytes(StandardCharsets.UTF_8),
                                         keyString.getBytes(StandardCharsets.UTF_8));
-                                // TODO: implement key being null
-                                // return new RecordConverter(destinationTable, value.getBytes(), key == null ? null : key.getBytes());
                             } catch (Exception e) {
                                 throw new RuntimeException("Error parsing message as JSON", e);
                             }
@@ -102,7 +97,8 @@ public class OlakeRowsIngester extends StringArrayServiceGrpc.StringArrayService
             try {
                 return IcebergUtil.createIcebergTable(icebergCatalog, tableId, sampleEvent.icebergSchema(true), "parquet");
             } catch (Exception e) {
-                throw new DebeziumException("Failed to create table from debezium event schema:" + tableId + " Error:" + e.getMessage(), e);
+                LOGGER.error("Failed to create table from event schema: {} Error: {}", tableId, e.getMessage(), e);
+                throw new RuntimeException("Failed to create table from event schema: " + tableId + " Error: " + e.getMessage(), e);
             }
         });
     }
