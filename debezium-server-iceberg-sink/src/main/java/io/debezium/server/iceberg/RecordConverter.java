@@ -33,8 +33,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
-import static io.debezium.server.iceberg.IcebergChangeConsumer.keyDeserializer;
-import static io.debezium.server.iceberg.IcebergChangeConsumer.valDeserializer;
+import static io.debezium.server.iceberg.OlakeRpcServer.keyDeserializer;
+import static io.debezium.server.iceberg.OlakeRpcServer.valDeserializer;
 
 /**
  * Converts iceberg json event to Iceberg GenericRecord. Extracts event schema and key fields. Converts event schema to Iceberg Schema.
@@ -46,7 +46,8 @@ public class RecordConverter {
   protected static final ObjectMapper mapper = new ObjectMapper();
   protected static final Logger LOGGER = LoggerFactory.getLogger(RecordConverter.class);
   public static final List<String> TS_MS_FIELDS = List.of("__ts_ms", "__source_ts_ms");
-  static final boolean eventsAreUnwrapped = IcebergUtil.configIncludesUnwrapSmt();
+  // static final boolean eventsAreUnwrapped = IcebergUtil.configIncludesUnwrapSmt();
+  static final boolean eventsAreUnwrapped = true;
   protected final String destination;
   protected final byte[] valueData;
   protected final byte[] keyData;
