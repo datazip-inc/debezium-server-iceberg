@@ -147,17 +147,365 @@ public class IcebergTableOperator {
    * @param newSchema
    */
   private void applyFieldAddition(Table icebergTable, Schema newSchema) {
-
-    UpdateSchema us = icebergTable.updateSchema().
-        unionByNameWith(newSchema).
-        setIdentifierFields(newSchema.identifierFieldNames());
-    Schema newSchemaCombined = us.apply();
-
-    // @NOTE avoid committing when there is no schema change. commit creates new commit even when there is no change!
-    if (!icebergTable.schema().sameSchema(newSchemaCombined)) {
-      LOGGER.warn("Extending schema of {}", icebergTable.name());
-      us.commit();
+    Schema existingSchema = icebergTable.schema();
+    
+    // Create a modified schema that preserves existing types for incompatible type changes
+    List<org.apache.iceberg.types.Types.NestedField> modifiedFields = new ArrayList<>();
+    boolean schemaModified = false;
+    
+    // First, add all existing fields to the modified schema
+    for (org.apache.iceberg.types.Types.NestedField existingField : existingSchema.columns()) {
+      modifiedFields.add(existingField);
     }
+    
+    // Then, check for new fields or type changes
+    for (org.apache.iceberg.types.Types.NestedField newField : newSchema.columns()) {
+      String fieldName = newField.name();
+      org.apache.iceberg.types.Types.NestedField existingField = existingSchema.findField(fieldName);
+      
+      // If field doesn't exist in the current schema, add it
+      if (existingField == null) {
+        modifiedFields.add(newField);
+        schemaModified = true;
+        LOGGER.info("Adding new field '{}' of type {}", fieldName, newField.type());
+      } 
+      // If field exists with a different type
+      else if (!existingField.type().equals(newField.type())) {
+        // Check if we should keep the existing type to avoid schema evolution errors
+        if (canSafelyUseExistingType(existingField.type(), newField.type())) {
+          LOGGER.info("Preserving existing type {} for field '{}' instead of changing to {}", 
+              existingField.type(), fieldName, newField.type());
+          // We keep the existing field, which is already in modifiedFields
+        } else {
+          LOGGER.warn("Type change detected for field '{}': {} -> {}. This may cause schema evolution errors.", 
+              fieldName, existingField.type(), newField.type());
+          // We'll try to use the new type, but this might fail during schema update
+          // Remove the existing field from modifiedFields and add the new one
+          modifiedFields.removeIf(f -> f.name().equals(fieldName));
+          modifiedFields.add(newField);
+          schemaModified = true;
+        }
+      }
+    }
+    
+    // Only update the schema if there are changes
+    if (schemaModified) {
+      try {
+        // Create a new schema with the modified fields
+        Schema modifiedSchema = new Schema(modifiedFields, newSchema.identifierFieldIds());
+        
+        // Apply the schema update
+        UpdateSchema us = icebergTable.updateSchema();
+        us = us.unionByNameWith(modifiedSchema)
+               .setIdentifierFields(modifiedSchema.identifierFieldNames());
+        
+        LOGGER.warn("Extending schema of {}", icebergTable.name());
+        us.commit();
+      } catch (Exception e) {
+        LOGGER.error("Failed to update schema: {}", e.getMessage(), e);
+        throw new RuntimeException("Failed to update schema: " + e.getMessage(), e);
+      }
+    }
+  }
+  
+  /**
+   * Determines if we can safely use the existing column type instead of changing to the new type.
+   * This helps avoid schema evolution errors for incompatible type changes.
+   * 
+   * @param existingType The existing column type in the table
+   * @param newType The new type from incoming data
+   * @return true if we can safely use the existing type, false otherwise
+   */
+  private boolean canSafelyUseExistingType(org.apache.iceberg.types.Type existingType, org.apache.iceberg.types.Type newType) {
+    // If types are the same, we can use the existing type
+    if (existingType.equals(newType)) {
+      return true;
+    }
+    
+    LOGGER.debug("Checking type compatibility: existing={}, new={}", existingType, newType);
+    
+    // Check for specific type combinations that are problematic in Iceberg
+    if (existingType.isPrimitiveType() && newType.isPrimitiveType()) {
+      org.apache.iceberg.types.Type.TypeID existingTypeId = existingType.typeId();
+      org.apache.iceberg.types.Type.TypeID newTypeId = newType.typeId();
+      
+      LOGGER.debug("Comparing primitive types: existing={}, new={}", existingTypeId, newTypeId);
+      
+      // Handle int -> float/double (not allowed by Iceberg)
+      if (existingTypeId == org.apache.iceberg.types.Type.TypeID.INTEGER &&
+          (newTypeId == org.apache.iceberg.types.Type.TypeID.FLOAT || 
+           newTypeId == org.apache.iceberg.types.Type.TypeID.DOUBLE)) {
+        LOGGER.info("Detected int -> float/double change, will preserve int type and convert values");
+        // We'll use the existing int type and rely on TypeConverter to handle the conversion
+        return true;
+      }
+      
+      // Handle long -> float/double (not allowed by Iceberg)
+      if (existingTypeId == org.apache.iceberg.types.Type.TypeID.LONG &&
+          (newTypeId == org.apache.iceberg.types.Type.TypeID.FLOAT || 
+           newTypeId == org.apache.iceberg.types.Type.TypeID.DOUBLE)) {
+        LOGGER.info("Detected long -> float/double change, will preserve long type and convert values");
+        // We'll use the existing long type and rely on TypeConverter to handle the conversion
+        return true;
+      }
+      
+      // For other primitive type changes, check if Iceberg allows the promotion
+      boolean compatible = io.debezium.server.iceberg.TypeConverter.isTypeChangeCompatible(existingTypeId, newTypeId);
+      LOGGER.debug("Type change compatibility check: {} -> {} = {}", existingTypeId, newTypeId, compatible);
+      return compatible;
+    }
+    
+    // For complex types, we generally can't safely convert
+    LOGGER.debug("Complex type change detected, cannot safely convert");
+    return false;
+  }
+
+  /**
+   * Adapts a record to match the table schema, handling type conversions as needed.
+   * This ensures that incoming data with different types can be safely written to
+   * the existing table schema.
+   *
+   * @param record The record wrapper to adapt
+   * @param tableSchema The target table schema
+   */
+  private void adaptRecordToTableSchema(RecordWrapper record, Schema tableSchema) {
+    if (record == null) {
+      return;
+    }
+    
+    LOGGER.debug("Adapting record to table schema");
+    
+    // Process each field in the table schema
+    for (org.apache.iceberg.types.Types.NestedField field : tableSchema.columns()) {
+      String fieldName = field.name();
+      Object fieldValue = record.getField(fieldName);
+      
+      // Skip null values
+      if (fieldValue == null) {
+        continue;
+      }
+      
+      // Get the expected type from the table schema
+      org.apache.iceberg.types.Type expectedType = field.type();
+      
+      LOGGER.debug("Field '{}': value='{}' (type={}) expected type={}", 
+          fieldName, fieldValue, fieldValue.getClass().getName(), expectedType);
+      
+      // Check if the value's type matches the expected type
+      if (!isValueTypeCompatible(fieldValue, expectedType)) {
+        LOGGER.info("Type mismatch for field '{}': value='{}' (type={}) expected type={}", 
+            fieldName, fieldValue, fieldValue.getClass().getName(), expectedType);
+        
+        try {
+          // Try to convert the value to the expected type
+          Object convertedValue = convertValueToExpectedType(fieldValue, expectedType, fieldName);
+          if (convertedValue != null) {
+            // Set the converted value back to the record
+            record.setField(fieldName, convertedValue);
+            LOGGER.info("Converted value for field '{}' from {} ({}) to {} ({})", 
+                fieldName, fieldValue, fieldValue.getClass().getSimpleName(), 
+                convertedValue, convertedValue.getClass().getSimpleName());
+          }
+        } catch (Exception e) {
+          // Log the error but continue with other fields
+          LOGGER.error("Failed to convert value for field '{}': {} - {}", 
+              fieldName, e.getMessage(), e.getClass().getName());
+          // If the field is required, we might want to throw an exception here
+          if (!field.isOptional()) {
+            throw new RuntimeException("Failed to convert required field '" + fieldName + 
+                "' value '" + fieldValue + "' to type " + expectedType, e);
+          }
+        }
+      }
+    }
+  }
+  
+  /**
+   * Checks if a value's type is compatible with the expected Iceberg type.
+   *
+   * @param value The value to check
+   * @param expectedType The expected Iceberg type
+   * @return true if compatible, false otherwise
+   */
+  private boolean isValueTypeCompatible(Object value, org.apache.iceberg.types.Type expectedType) {
+    if (value == null) {
+      return true;
+    }
+    
+    org.apache.iceberg.types.Type.TypeID typeId = expectedType.typeId();
+    
+    switch (typeId) {
+      case INTEGER:
+        return value instanceof Integer;
+      case LONG:
+        return value instanceof Long;
+      case FLOAT:
+        return value instanceof Float;
+      case DOUBLE:
+        return value instanceof Double;
+      case BOOLEAN:
+        return value instanceof Boolean;
+      case STRING:
+        return value instanceof String;
+      case DECIMAL:
+        return value instanceof java.math.BigDecimal;
+      case TIMESTAMP:
+        return value instanceof java.time.OffsetDateTime;
+      case UUID:
+        return value instanceof java.util.UUID;
+      case BINARY:
+        return value instanceof java.nio.ByteBuffer;
+      default:
+        // For complex types, we'd need more sophisticated checks
+        return true;
+    }
+  }
+  
+  /**
+   * Converts a value to the expected Iceberg type.
+   *
+   * @param value The value to convert
+   * @param expectedType The expected Iceberg type
+   * @param fieldName Field name for logging
+   * @return The converted value
+   */
+  private Object convertValueToExpectedType(Object value, org.apache.iceberg.types.Type expectedType, String fieldName) {
+    if (value == null) {
+      return null;
+    }
+    
+    org.apache.iceberg.types.Type.TypeID typeId = expectedType.typeId();
+    LOGGER.debug("Converting value '{}' of type {} to {}", value, value.getClass().getName(), typeId);
+    
+    switch (typeId) {
+      case INTEGER:
+        if (value instanceof Float) {
+          float floatVal = (Float) value;
+          LOGGER.debug("Attempting to convert float {} to int", floatVal);
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToInt(floatVal)) {
+            LOGGER.info("Successfully converted float {} to int {}", floatVal, (int) floatVal);
+            return (int) floatVal;
+          } else {
+            LOGGER.warn("Cannot safely convert float {} to int - would lose precision", floatVal);
+          }
+        } else if (value instanceof Double) {
+          double doubleVal = (Double) value;
+          LOGGER.debug("Attempting to convert double {} to int", doubleVal);
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToInt(doubleVal)) {
+            LOGGER.info("Successfully converted double {} to int {}", doubleVal, (int) doubleVal);
+            return (int) doubleVal;
+          } else {
+            LOGGER.warn("Cannot safely convert double {} to int - would lose precision", doubleVal);
+          }
+        } else if (value instanceof Long) {
+          long longVal = (Long) value;
+          LOGGER.debug("Attempting to convert long {} to int", longVal);
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToInt(longVal)) {
+            LOGGER.info("Successfully converted long {} to int {}", longVal, (int) longVal);
+            return (int) longVal;
+          } else {
+            LOGGER.warn("Cannot safely convert long {} to int - value out of range", longVal);
+          }
+        } else if (value instanceof String) {
+          try {
+            LOGGER.debug("Attempting to convert string '{}' to int", value);
+            return Integer.parseInt((String) value);
+          } catch (NumberFormatException e) {
+            // Try parsing as double first, then convert to int if possible
+            try {
+              double parsed = Double.parseDouble((String) value);
+              LOGGER.debug("Parsed string '{}' as double {}, checking if can convert to int", value, parsed);
+              if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToInt(parsed)) {
+                LOGGER.info("Successfully converted string '{}' to int {}", value, (int) parsed);
+                return (int) parsed;
+              } else {
+                LOGGER.warn("Cannot safely convert string '{}' (parsed as {}) to int - would lose precision", value, parsed);
+              }
+            } catch (NumberFormatException e2) {
+              LOGGER.warn("Cannot parse string '{}' as a number", value);
+            }
+          }
+        }
+        break;
+        
+      case LONG:
+        if (value instanceof Integer) {
+          return ((Integer) value).longValue();
+        } else if (value instanceof Float) {
+          float floatVal = (Float) value;
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToLong(floatVal)) {
+            return (long) floatVal;
+          }
+        } else if (value instanceof Double) {
+          double doubleVal = (Double) value;
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToLong(doubleVal)) {
+            return (long) doubleVal;
+          }
+        } else if (value instanceof String) {
+          try {
+            return Long.parseLong((String) value);
+          } catch (NumberFormatException e) {
+            // Try parsing as double first, then convert to long if possible
+            double parsed = Double.parseDouble((String) value);
+            if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToLong(parsed)) {
+              return (long) parsed;
+            }
+          }
+        }
+        break;
+        
+      case FLOAT:
+        if (value instanceof Integer) {
+          return ((Integer) value).floatValue();
+        } else if (value instanceof Long) {
+          return ((Long) value).floatValue();
+        } else if (value instanceof Double) {
+          double doubleVal = (Double) value;
+          if (io.debezium.server.iceberg.TypeConverter.canSafelyConvertToFloat(doubleVal)) {
+            return (float) doubleVal;
+          }
+        } else if (value instanceof String) {
+          return Float.parseFloat((String) value);
+        }
+        break;
+        
+      case DOUBLE:
+        if (value instanceof Integer) {
+          return ((Integer) value).doubleValue();
+        } else if (value instanceof Long) {
+          return ((Long) value).doubleValue();
+        } else if (value instanceof Float) {
+          return ((Float) value).doubleValue();
+        } else if (value instanceof String) {
+          return Double.parseDouble((String) value);
+        }
+        break;
+        
+      case STRING:
+        // Almost anything can be converted to string
+        return value.toString();
+        
+      case BOOLEAN:
+        if (value instanceof String) {
+          String strVal = ((String) value).toLowerCase();
+          if (strVal.equals("true") || strVal.equals("false")) {
+            return Boolean.parseBoolean(strVal);
+          } else if (strVal.equals("1") || strVal.equals("0")) {
+            return strVal.equals("1");
+          }
+        } else if (value instanceof Number) {
+          int numVal = ((Number) value).intValue();
+          if (numVal == 1 || numVal == 0) {
+            return numVal == 1;
+          }
+        }
+        break;
+        
+      // For other types, we'd need more sophisticated conversions
+    }
+    
+    throw new RuntimeException("Cannot convert value '" + value + "' of type " + 
+        value.getClass().getSimpleName() + " to " + typeId + " for field '" + fieldName + "'");
   }
 
   /**
@@ -183,8 +531,32 @@ public class IcebergTableOperator {
       // if field additions not enabled add set of events to table
       addToTablePerSchema(icebergTable, events);
     } else {
+      // First, pre-adapt all records to match the existing schema
+      // This helps us identify if we can handle type conversions without schema evolution
+      List<RecordConverter> adaptedEvents = new ArrayList<>();
+      
+      for (RecordConverter event : events) {
+        try {
+          // Convert the event to a record
+          RecordWrapper record = (upsert && !icebergTable.schema().identifierFieldIds().isEmpty()) 
+              ? event.convert(icebergTable.schema(), cdcOpField) 
+              : event.convertAsAppend(icebergTable.schema());
+          
+          // Try to adapt the record to the existing schema
+          adaptRecordToTableSchema(record, icebergTable.schema());
+          
+          // If adaptation succeeded, add to the adapted events list
+          adaptedEvents.add(event);
+        } catch (Exception e) {
+          // If adaptation failed, log and continue with the original event
+          LOGGER.warn("Failed to adapt record to existing schema: {}", e.getMessage());
+          adaptedEvents.add(event);
+        }
+      }
+      
+      // Group events by schema
       Map<RecordConverter.SchemaConverter, List<RecordConverter>> eventsGroupedBySchema =
-          events.stream()
+          adaptedEvents.stream()
               .collect(Collectors.groupingBy(RecordConverter::schemaConverter));
       LOGGER.debug("Batch got {} records with {} different schema!!", events.size(), eventsGroupedBySchema.keySet().size());
 
@@ -195,7 +567,6 @@ public class IcebergTableOperator {
         addToTablePerSchema(icebergTable, schemaEvents.getValue());
       }
     }
-
   }
 
   /**
@@ -219,10 +590,19 @@ public class IcebergTableOperator {
         
         // Write all events
         for (RecordConverter e : events) {
-          final RecordWrapper record = (upsert && !icebergTable.schema().identifierFieldIds().isEmpty()) 
-              ? e.convert(icebergTable.schema(), cdcOpField) 
-              : e.convertAsAppend(icebergTable.schema());
-          writer.write(record);
+          try {
+            final RecordWrapper record = (upsert && !icebergTable.schema().identifierFieldIds().isEmpty()) 
+                ? e.convert(icebergTable.schema(), cdcOpField) 
+                : e.convertAsAppend(icebergTable.schema());
+            
+            // Ensure the record matches the table schema (handles type conversions)
+            adaptRecordToTableSchema(record, icebergTable.schema());
+            
+            writer.write(record);
+          } catch (Exception ex) {
+            LOGGER.error("Failed to process record: {}", ex.getMessage(), ex);
+            throw new RuntimeException("Failed to process record: " + ex.getMessage(), ex);
+          }
         }
 
         WriteResult files = writer.complete();
@@ -273,6 +653,14 @@ public class IcebergTableOperator {
           LOGGER.warn("Failed to abort writer", e);
         }
         throw new DebeziumException("Failed to write data to table: " + icebergTable.name(), ex);
+      } catch (Exception ex) {
+        try {
+          writer.abort();
+        } catch (IOException e) {
+          LOGGER.warn("Failed to abort writer", e);
+        }
+        LOGGER.error("Unexpected error: {}", ex.getMessage(), ex);
+        throw new DebeziumException("Unexpected error processing data for table: " + icebergTable.name(), ex);
       } finally {
         try {
           writer.close();
