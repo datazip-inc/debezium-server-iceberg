@@ -185,88 +185,118 @@ public class RecordConverter {
 
   private static Object jsonValToIcebergVal(Types.NestedField field, JsonNode node) {
     LOGGER.debug("Processing Field:{} Type:{}", field.name(), field.type());
+    
+    // Handle null values
+    if (node == null || node.isNull()) {
+      return null;
+    }
+    
+    // Try using the TypeConverter first for handling type conversions and promotions
+    try {
+      Object convertedValue = TypeConverter.convertValueWithTypeHandling(field, node);
+      if (convertedValue != null) {
+        return convertedValue;
+      }
+    } catch (Exception e) {
+      // Log the error but throw the exception regardless of field optionality
+      LOGGER.error("Type conversion failed for field '{}' with value '{}': {}", field.name(), node, e.getMessage());
+      
+      // Always throw an exception, regardless of whether the field is optional or not
+      throw new RuntimeException("Failed to convert field '" + field.name() + 
+              "' with value '" + node + "' to type " + field.type().typeId() + ": " + e.getMessage(), e);
+    }
+    
+    // Fall back to the original conversion logic if TypeConverter fails
     final Object val;
-    switch (field.type().typeId()) {
-      case INTEGER: // int 4 bytes
-        val = node.isNull() ? null : node.asInt();
-        break;
-      case LONG: // long 8 bytes
-        val = node.isNull() ? null : node.asLong();
-        break;
-      case FLOAT: // float is represented in 32 bits,
-        val = node.isNull() ? null : node.floatValue();
-        break;
-      case DOUBLE: // double is represented in 64 bits
-        val = node.isNull() ? null : node.asDouble();
-        break;
-      case BOOLEAN:
-        val = node.isNull() ? null : node.asBoolean();
-        break;
-      case STRING:
-        // if the node is not a value node (method isValueNode returns false), convert it to string.
-        val = node.isValueNode() ? node.asText(null) : node.toString();
-        break;
-      case UUID:
-        val = node.isValueNode() ? UUID.fromString(node.asText(null)) : UUID.fromString(node.toString());
-        break;
-      case TIMESTAMP:
-        if ((node.isLong() || node.isNumber()) && TS_MS_FIELDS.contains(field.name())) {
-          val = OffsetDateTime.ofInstant(Instant.ofEpochMilli(node.longValue()), ZoneOffset.UTC);
-        } else if (node.isTextual()) {
-          val = OffsetDateTime.parse(node.asText());
-        } else {
-          throw new RuntimeException("Failed to convert timestamp value, field: " + field.name() + " value: " + node);
-        }
-        break;
-      case BINARY:
-        try {
-          val = node.isNull() ? null : ByteBuffer.wrap(node.binaryValue());
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to convert binary value to iceberg value, field: " + field.name(), e);
-        }
-        break;
-      case LIST:
-        Types.NestedField listItemsType = field.type().asListType().fields().get(0);
-        // recursive value mapping when list elements are nested type
-        if (listItemsType.type().isNestedType()) {
-          ArrayList<Object> listVal = new ArrayList<>();
-          node.elements().forEachRemaining(element -> {
-            listVal.add(jsonValToIcebergVal(field.type().asListType().fields().get(0), element));
-          });
-          val = listVal;
+    try {
+      switch (field.type().typeId()) {
+        case INTEGER: // int 4 bytes
+          val = node.isNull() ? null : node.asInt();
           break;
-        }
-
-        val = mapper.convertValue(node, ArrayList.class);
-        break;
-      case MAP:
-        Type keyType = field.type().asMapType().keyType();
-        Type valType = field.type().asMapType().valueType();
-        if (keyType.isPrimitiveType() && valType.isPrimitiveType()) {
-          val = mapper.convertValue(node, Map.class);
+        case LONG: // long 8 bytes
+          val = node.isNull() ? null : node.asLong();
           break;
-        }
-        // convert complex/nested map value with recursion
-        HashMap<Object, Object> mapVal = new HashMap<>();
-        node.fields().forEachRemaining(f -> {
-          if (valType.isStructType()) {
-            mapVal.put(f.getKey(), convert(valType.asStructType(), f.getValue()));
+        case FLOAT: // float is represented in 32 bits,
+          val = node.isNull() ? null : node.floatValue();
+          break;
+        case DOUBLE: // double is represented in 64 bits
+          val = node.isNull() ? null : node.asDouble();
+          break;
+        case BOOLEAN:
+          val = node.isNull() ? null : node.asBoolean();
+          break;
+        case STRING:
+          // if the node is not a value node (method isValueNode returns false), convert it to string.
+          val = node.isValueNode() ? node.asText(null) : node.toString();
+          break;
+        case UUID:
+          val = node.isValueNode() ? UUID.fromString(node.asText(null)) : UUID.fromString(node.toString());
+          break;
+        case TIMESTAMP:
+          if ((node.isLong() || node.isNumber()) && TS_MS_FIELDS.contains(field.name())) {
+            val = OffsetDateTime.ofInstant(Instant.ofEpochMilli(node.longValue()), ZoneOffset.UTC);
+          } else if (node.isTextual()) {
+            val = OffsetDateTime.parse(node.asText());
           } else {
-            mapVal.put(f.getKey(), f.getValue());
+            throw new RuntimeException("Failed to convert timestamp value, field: " + field.name() + " value: " + node);
           }
-        });
-        val = mapVal;
-        break;
-      case STRUCT:
-        // create it as struct, nested type
-        // recursive call to get nested data/record
-        val = convert(field.type().asStructType(), node);
-        break;
-      default:
-        // default to String type
-        // if the node is not a value node (method isValueNode returns false), convert it to string.
-        val = node.isValueNode() ? node.asText(null) : node.toString();
-        break;
+          break;
+        case BINARY:
+          try {
+            val = node.isNull() ? null : ByteBuffer.wrap(node.binaryValue());
+          } catch (IOException e) {
+            throw new RuntimeException("Failed to convert binary value to iceberg value, field: " + field.name(), e);
+          }
+          break;
+        case LIST:
+          Types.NestedField listItemsType = field.type().asListType().fields().get(0);
+          // recursive value mapping when list elements are nested type
+          if (listItemsType.type().isNestedType()) {
+            ArrayList<Object> listVal = new ArrayList<>();
+            node.elements().forEachRemaining(element -> {
+              listVal.add(jsonValToIcebergVal(field.type().asListType().fields().get(0), element));
+            });
+            val = listVal;
+            break;
+          }
+
+          val = mapper.convertValue(node, ArrayList.class);
+          break;
+        case MAP:
+          Type keyType = field.type().asMapType().keyType();
+          Type valType = field.type().asMapType().valueType();
+          if (keyType.isPrimitiveType() && valType.isPrimitiveType()) {
+            val = mapper.convertValue(node, Map.class);
+            break;
+          }
+          // convert complex/nested map value with recursion
+          HashMap<Object, Object> mapVal = new HashMap<>();
+          node.fields().forEachRemaining(f -> {
+            if (valType.isStructType()) {
+              mapVal.put(f.getKey(), convert(valType.asStructType(), f.getValue()));
+            } else {
+              mapVal.put(f.getKey(), f.getValue());
+            }
+          });
+          val = mapVal;
+          break;
+        case STRUCT:
+          // create it as struct, nested type
+          // recursive call to get nested data/record
+          val = convert(field.type().asStructType(), node);
+          break;
+        default:
+          // Try converting to string as a last resort
+          LOGGER.warn("Unhandled type {} for field '{}', converting to string", field.type().typeId(), field.name());
+          val = node.isValueNode() ? node.asText(null) : node.toString();
+          break;
+      }
+    } catch (Exception e) {
+      // If all attempts at conversion fail, always throw an exception
+      LOGGER.error("Failed to convert field '{}' with value '{}' to type {}: {}", 
+          field.name(), node, field.type().typeId(), e.getMessage());
+      throw new RuntimeException("Failed to convert field '" + field.name() + 
+          "' with value '" + node + "' to type " + field.type().typeId() + ": " + e.getMessage(), e);
     }
 
     return val;
